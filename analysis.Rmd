@@ -1,0 +1,308 @@
+---
+title: "aging markers"
+author: "yuxin"
+date: "2026-01-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+# brain aging in N. rachovii
+
+##0.dataset
+
+```{r tcga_data}
+
+tpm_matrix_f<-tpm_matrix[,meta_filtered$SRR]
+
+```
+
+##1 Train and Test DEG
+
+```{r survival_DEG, include=FALSE, echo = FALSE}
+
+group<-meta_filtered$groups
+#328
+set.seed(10)
+retained = colnames(tpm_matrix_f) %in% sample(colnames(tpm_matrix_f),ceiling(0.7*ncol(tpm_matrix_f)))
+#retained
+
+train<-as.numeric_matrix(tpm_matrix_f[,retained])
+group_for_train<-group[retained]
+pvalue = 0.01
+
+DEG_RES<-limma_DEG(train,group_for_train,pvalue,'BH')
+
+pval_cutoff = 0.05
+logFC_cutoff = 0
+
+# 添加差异分组列
+DEG_RES_plot <- DEG_RES %>%
+  mutate(
+    change = case_when(
+      adj.P.Val < pval_cutoff & logFC > logFC_cutoff ~ "Up",
+      adj.P.Val < pval_cutoff & logFC < -logFC_cutoff ~ "Down",
+      TRUE ~ "Not"
+    )
+  )
+
+# 筛选显著差异基因
+sig_genes <- DEG_RES_plot %>%
+  filter(change != "Not")
+
+
+p <- ggplot(DEG_RES_plot, aes(x = logFC, y = -log10(adj.P.Val), color = change)) +
+  geom_point(alpha = 0.6, size = 2) +  # 基础散点
+  geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff), 
+            linetype = "dashed", color = "grey", linewidth = 0.6) +  # FC阈值线
+  geom_hline(yintercept = -log10(pval_cutoff), 
+            linetype = "dashed", color = "grey", linewidth = 0.6) +  # p值阈值线
+  scale_color_manual(values = c("Up" = "#E63946", "Down" = "#2A9D8F", "Not" = "grey")) +  # 自定义颜色
+  labs(
+    title = "Volcano Plot",
+    x = "log2(Fold Change)",
+    y = "-log10(Adjusted P-value)"
+  ) +
+  theme_classic(base_size = 14) +  # 主题美化
+  theme(legend.position = "right")
+
+```
+
+##2 e-net
+
+```{r}
+seed = 10
+AUC2 = 0
+AUC1 = 0
+library(pROC)
+set.seed(seed)
+retained = colnames(tpm_matrix_f) %in% sample(colnames(tpm_matrix_f),ceiling(0.7*ncol(tpm_matrix_f)))
+
+group_for_train<-group[retained]
+
+DEG_RES<-limma_DEG(as.numeric_matrix(tpm_matrix_f[,retained]),group_for_train,1,'BH',T)
+
+RES_GENE<-DEG_RES$label[as.numeric(DEG_RES$adj.P.Val)<0.05]
+
+if((length(RES_GENE))<2) next
+train<-as.numeric_matrix(tpm_matrix_f[RES_GENE,retained])
+test<-as.numeric_matrix(tpm_matrix_f[RES_GENE,!retained])
+model_cv<-glmnet::cv.glmnet(t(train),
+                            as.factor(group_for_train),
+                            family = "binomial",
+                            #cox model in enet was used, note that here cox and enet penalty were used.
+                            alpha = 0.1,
+                            # The elasticnet mixing parameter, with 0≤α≤ 1. The penalty is defined as
+                            # (1-alpha)/2||beta||_2^2+alpha||beta||_1
+                            # alpha=1 is the lasso penalty, and alpha=0 the ridge penalty.
+                            type.measure = "class",
+                            # type.measure= "C",
+                            # It uses AUC as the criterion for 10-fold cross-validation.
+                            nfolds = 10
+)
+
+```
+
+## 3 kknn
+
+```{r}
+seed = 10
+AUC2 = 0
+AUC1 = 0
+
+set.seed(seed)
+retained = colnames(tpm_matrix_f) %in% sample(colnames(tpm_matrix_f),ceiling(0.7*ncol(tpm_matrix_f)))
+#retained
+
+group_for_train<- as.factor(group[retained])
+group_for_test <- as.factor(group[!retained])
+DEG_RES<-limma_DEG(as.numeric_matrix(tpm_matrix_f[,retained]),group_for_train,1,'BH',T)
+
+RES_GENE<-DEG_RES$label[as.numeric(DEG_RES$adj.P.Val)<0.05]
+
+train<-as.numeric_matrix(tpm_matrix_f[RES_GENE,retained])
+test<-as.numeric_matrix(tpm_matrix_f[RES_GENE,!retained])
+
+tainingset<-data.frame(t(train[RES_GENE,]),group_for_train)
+testset<-data.frame(t(test[RES_GENE,]),group_for_train= as.factor(group[!retained]))
+
+tasks<-as_task_classif(group_for_train ~ ., data = tainingset, positive = "O")
+task_test<-as_task_classif(group_for_train ~ ., data = testset, positive = "O")
+final_model<-best_learner$train(tasks)
+train_pred <- final_model$predict(tasks)
+AUC1 <- train_pred$score(msrs(c("classif.auc")))
+cat("训练集准确率：", AUC1, "\n")
+
+test_pred <- final_model$predict(task_test)
+AUC2 <- test_pred$score(msrs(c("classif.auc")))
+cat("测试集准确率：", AUC2, "\n")
+
+external_test<-t(merged_tpm_matrix[RES_GENE,])
+external_test<-as.numeric_matrix(external_test)
+external_group<-factor(c("Y","Y","Y","O","Y","O","Y","O","O","O"))
+external_testset<-data.frame(external_test,group_for_train= factor(c("Y","Y","Y","O","Y","O","Y","O","O","O")))
+external_testset_task <-as_task_classif(group_for_train ~ ., data = external_testset, positive = "O")
+external_test_pred <- final_model$predict(external_testset_task)
+external_test_pred$score(msrs(c("classif.auc")))
+
+task_test<-as_task_classif(group_for_train ~ ., data = testset, positive = "O")
+DEG_INFO<-merged_12[RES_GENE,]
+for (variable in rownames(DEG_INFO)) {
+if (DEG_INFO[variable,]$`Gene Name`=="-"){
+  DEG_INFO[variable,]$`Gene Name` = gtf_df[gtf_df$ID == variable,"Note"]
+}
+}
+DEG_INFO<- merge(DEG[RES_GENE,],DEG_INFO, by="Gene ID", all=TRUE)
+
+```
+
+##4 KEGG GO
+
+```{r}
+
+library(DOSE)
+library(clusterProfiler)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler", "org.Hs.eg.db", "enrichplot"))
+library(clusterProfiler)
+
+library(enrichplot)    # 可视化增强包
+org_db_fur<-AnnotationDbi::loadDb(file = "org.Nothobranchius_furzeri.eg.db")
+
+gene_list <- bitr(DEG_INFO$`Gene Name`, 
+                  fromType = "SYMBOL", 
+                  toType = "ENTREZID",
+                  OrgDb = org_db)
+
+ego <- enrichGO(
+  gene = gene_list$ENTREZID,  # 转换后的基因ID
+  OrgDb = org_db,
+  keyType = "ENTREZID",
+  ont = "BP",  # BP（生物学过程）/MF（分子功能）/CC（细胞组分）
+  pAdjustMethod = "BH",  # 多重检验校正方法
+  pvalueCutoff = 0.05,   # 显著性阈值
+  qvalueCutoff = 0.05,
+  readable = TRUE        # 转换为可读基因名
+)
+
+ego_MF <- enrichGO(
+  gene = gene_list$ENTREZID,  # 转换后的基因ID
+  OrgDb = org_db,
+  keyType = "ENTREZID",
+  ont = "MF",  # BP（生物学过程）/MF（分子功能）/CC（细胞组分）
+  pAdjustMethod = "BH",  # 多重检验校正方法
+  pvalueCutoff = 0.05,   # 显著性阈值
+  qvalueCutoff = 0.05,
+  readable = TRUE        # 转换为可读基因名
+)
+
+ego_CC <- enrichGO(
+  gene = gene_list$ENTREZID,  # 转换后的基因ID
+  OrgDb = org_db,
+  keyType = "ENTREZID",
+  ont = "CC",  # BP（生物学过程）/MF（分子功能）/CC（细胞组分）
+  pAdjustMethod = "BH",  # 多重检验校正方法
+  pvalueCutoff = 0.05,   # 显著性阈值
+  qvalueCutoff = 0.05,
+  readable = TRUE        # 转换为可读基因名
+)
+
+
+kk <- enrichKEGG(
+  gene = gene_list$ENTREZID,
+  organism = "nfu",  
+  keyType = "kegg",  
+  pvalueCutoff = 0.5,
+  qvalueCutoff = 0.5,
+)
+kk_readable <- setReadable(kk, OrgDb = org_db, keyType = "ENTREZID")
+# GO条形图（按富集程度排序）
+barplot(ego, showCategory = 10, title = "GO Enrichment")
+barplot(kk, showCategory = 10, title = "KEGG Enrichment")
+# KEGG气泡图（气泡大小=p值，颜色=校正p值）
+gdot <- dotplot(kk, showCategory = 10, title = "KEGG Enrichment")
+
+# 网络图（展示GO术语间关系）
+cnetplot(ego, categorySize = "pvalue", showCategory = 5)
+# 热力图（基因-通路关联）
+heatplot(kk, foldChange = DEG_INFO$AveExpr)  # 需提供基因表达量变化值
+
+# 环形图（GO层级结构）
+goplot(ego)  # 自动生成GO DAG的环形布局
+
+ggplot2::ggsave(gdot,filename = "KEGG.jpg")
+
+```
+
+
+##5 pheatmap
+
+```{r kmeans, include=FALSE, echo = FALSE}
+
+pheatmap_data<-t(data.frame(external_test_pred$prob))
+rownames(pheatmap_data)<-c("prediction_O","prediction_Y")
+colnames(pheatmap_data)<-c("B01","B02","B03","B04","B05","B06","B07","B08","B09","B10")
+annotation_col <- data.frame(
+  Group = external_group,
+  row.names = colnames(pheatmap_data)
+)
+pht<-pheatmap::pheatmap(pheatmap_data,
+                        cluster_rows = F,cluster_cols = T,
+                        fontsize = 15,
+                        annotation_col = annotation_col,
+                        show_colnames = F,height = 100,width = 10)
+
+ggsave(plot = pht,filename = paste("pheatmap.jpeg",sep = ''),device ="jpeg" ,
+       path = './',dpi = 300,units = "in",width = 15*0.4, height = 22,
+       limitsize=F)
+```
+
+##6 boxplot
+
+```{r}
+#检测可能是宽数据，转换为长数据
+if(ncol(df)>=3&&length(grep("value|groups",colnames(df)))==0){
+  df <- reshape2::melt(
+    df,  id.vars = c("y"),    # 保留的主字段
+    variable.name = "groups",           # 分类列名
+    value.name = "value"         # 值列名
+)
+}
+
+df$value<-as.numeric(df$value)
+
+summary_data <- df %>%
+  group_by(groups) %>%
+  summarise(mean_mape = mean(value),
+            se_mape = sd(value) / sqrt(n())) # 计算标准误差
+# 定义一个颜色向量，包含六个深色调颜色
+colors <- c("#6A3D9A", "#1F78B4", "#FF7F00", "#E31A1C", "#33A02C", "#666666")
+
+# 绘制柱形图并添加误差棒
+p <- ggplot(summary_data, aes(x = groups, y = mean_mape, fill = groups)) +
+  geom_col(alpha = 1,width = 0.5,position = position_dodge(width = 0.5)) + 
+  geom_errorbar(aes(ymin = mean_mape - se_mape, ymax = mean_mape + se_mape), 
+                width = 0.2, color = "black") +
+  scale_fill_manual(values = colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + # 让 Y 轴从 0 开始
+  labs(title = graph_title,
+       x = stringr::str_to_title(colselect),
+       y = "Value") +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_line(color = "gray95"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),  
+    axis.text = element_text(color = "black"), 
+    axis.title = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+  )
+
+
+ggsave(paste(wd,"/histogram_plot.png",sep = ""), plot = p, width = 5, height = 5, units = "in")
+
+```
